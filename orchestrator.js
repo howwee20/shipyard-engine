@@ -214,9 +214,8 @@ async function callOpenAI(ticket, scopeFiles) {
   const user = buildOpenAIInput(ticket, scopeFiles);
 
   const resp = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+    model: process.env.OPENAI_MODEL || "gpt-5-mini",
     response_format: { type: "json_object" },
-    temperature: 0,
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
