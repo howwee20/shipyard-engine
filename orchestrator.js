@@ -313,18 +313,19 @@ async function openPrAndEnableAutoMerge(octokit, ticket, branchName, baseBranch,
 
   try {
     await gql(
-      `mutation EnableAutoMerge($pullRequestId: ID!, $method: PullRequestMergeMethod!) {
-        enablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId, mergeMethod: $method }) {
-          clientMutationId
-        }
+      `mutation EnableAutoMerge(
+        $pullRequestId: ID!
+        $mergeMethod: PullRequestMergeMethod!
+      ) {
+        enablePullRequestAutoMerge(input: {
+          pullRequestId: $pullRequestId,
+          mergeMethod: $mergeMethod
+        }) { clientMutationId }
       }`,
-      {
-        pullRequestId: pr.data.node_id,
-        method: "SQUASH",
-      }
+      { pullRequestId: pr.data.node_id, mergeMethod: "SQUASH" }
     );
-  } catch (error) {
-    console.warn(`Auto-merge not enabled: ${error.message}`);
+  } catch (e) {
+    console.warn(`Auto-merge not enabled: ${e.message}`);
   }
 
   console.log(`PR ready: ${pr.data.html_url}`);
