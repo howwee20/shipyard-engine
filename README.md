@@ -57,11 +57,28 @@ guardrails:
 
 ## Usage
 
-Run via `npm start` or directly with Node. If `--ticket` is omitted, the sample ticket is used.
+A ready-to-run smoke ticket lives at `tickets/color-orange.md`; omit `--ticket` to fall back to `tickets/sample.md`.
+
+## Run
 
 ```bash
-npm start -- --ticket tickets/sample.md
-# or
+npm start -- --ticket tickets/color-orange.md
+```
+
+Set the following environment variables before running:
+
+- `OPENAI_API_KEY`
+- `GITHUB_TOKEN`
+- `GITHUB_OWNER`
+- `GITHUB_REPO` (defaults to `bloom`)
+- `GITHUB_BASE_BRANCH` (defaults to `main`)
+- `OPENAI_MODEL` (optional, defaults to `gpt-4.1-mini`)
+
+The target repository (for example, `bloom`) must have Vercel PR previews configured and native auto-merge enabled with at least one required check so the engine can arm auto-merge.
+
+Run via `npm start` or directly with Node if you need a custom ticket path.
+
+```bash
 node orchestrator.js --ticket path/to/ticket.md
 ```
 

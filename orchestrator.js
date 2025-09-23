@@ -14,8 +14,6 @@ const yargs = require("yargs/yargs");
 dotenv.config();
 
 const DEFAULT_TICKET_PATH = "tickets/sample.md";
-const OPENAI_SYSTEM_PROMPT =
-  'Return ONLY JSON: { "files": [ { "path":"…", "contents_base64":"…" } ] } — no prose, no backticks. Touch only files in scope. Minimize edits.';
 const MAX_FILES = 5;
 const MAX_FILE_SIZE = 200 * 1024; // 200KB
 
@@ -204,39 +202,37 @@ function validateModelFiles(modelFiles, scope) {
 }
 
 async function callOpenAI(ticket, scopeFiles) {
-  console.log("3/7 call OpenAI…");
-  const openai = new OpenAI({ apiKey: requireEnv("OPENAI_API_KEY") });
-  const input = buildOpenAIInput(ticket, scopeFiles);
+  const apiKey = requireEnv("OPENAI_API_KEY");
+  const openai = new OpenAI({ apiKey });
 
-  const response = await openai.responses.create({
+  const system = [
+    "You edit code for surgical tickets.",
+    'Return ONLY JSON exactly: {"files":[{"path":"...","contents_base64":"..."}]}',
+    "Touch ONLY files in scope. Keep edits minimal. No prose. No backticks.",
+  ].join("\n");
+
+  const user = buildOpenAIInput(ticket, scopeFiles);
+
+  const resp = await openai.chat.completions.create({
     model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+    response_format: { type: "json_object" },
     temperature: 0,
-    max_output_tokens: 2048,
-    input: [
-      {
-        role: "system",
-        content: [{ type: "text", text: OPENAI_SYSTEM_PROMPT }],
-      },
-      {
-        role: "user",
-        content: [{ type: "text", text: input }],
-      },
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
     ],
   });
 
-  const outputText = response?.output?.[0]?.content?.[0]?.text || response?.output_text;
-  if (!outputText) {
-    throw new Error("OpenAI response missing text payload.");
-  }
-
-  let json;
+  const text = resp.choices?.[0]?.message?.content?.trim() || "";
+  let parsed;
   try {
-    json = JSON.parse(outputText.trim());
-  } catch (error) {
-    throw new Error(`JSON invalid: ${error.message}`);
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("Model did not return valid JSON.");
   }
 
-  return validateModelFiles(json.files, ticket.scope);
+  const files = validateModelFiles(parsed.files, ticket.scope);
+  return files;
 }
 
 async function ensureBranch(octokit, owner, repo, baseBranch, branchName) {
@@ -363,10 +359,10 @@ async function run() {
   console.log("2/7 fetch scope files…");
   const scopeFiles = await fetchScopeFiles(octokit, owner, repo, baseBranch, ticket.scope);
 
+  console.log("3/7 call OpenAI…");
   const modelFiles = await callOpenAI(ticket, scopeFiles);
 
   console.log("4/7 validate JSON…");
-  // callOpenAI already validates, so this log acknowledges completion.
 
   console.log("5/7 create branch…");
   const branchName = `intent-${slugify(ticket.title)}-${nanoid(6)}`;
