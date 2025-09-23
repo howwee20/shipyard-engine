@@ -265,7 +265,7 @@ async function commitFiles(octokit, owner, repo, branchName, files, scopeFiles) 
       repo,
       path: file.path,
       message,
-      content: file.base64,
+      content: Buffer.from(file.contents, "utf8").toString("base64"),
       branch: branchName,
       sha: existingSha,
       committer: {
