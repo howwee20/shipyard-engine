@@ -1,67 +1,104 @@
-# Shipyard Engine v0
+# Shipyard Engine v1
 
-A minimal command line orchestrator that turns natural-language intents into GitHub pull requests with auto-merge enabled.
+Shipyard Engine turns structured human tickets into GitHub pull requests that are ready to auto-merge. Provide a ticket file, the engine gathers repository context, asks OpenAI for minimal edits, commits them on a feature branch, opens a PR, and attempts to arm auto-merge.
 
 ## Prerequisites
 
-- Node.js 18+
-- npm (to install dependencies)
-- GitHub personal access token (classic) or GitHub App installation token with `repo` scope
-- OpenAI API key with access to the chosen `OPENAI_MODEL`
+- Node.js 22+
+- npm to install dependencies
+- Repository with "Allow auto-merge" enabled or the optional scripted merge fallback
+- GitHub token with `contents:write`, `pull_requests:write`, and `metadata:read` access (a classic PAT with `repo` scope works)
+- OpenAI API key with access to the selected `OPENAI_MODEL`
+- Branch protection that requires at least one check (the bundled smoke workflow can satisfy this)
+- Vercel (or another CI) PR previews recommended; if unavailable, the smoke workflow provides a minimal required check
 
 ## Installation
 
 ```bash
-cd shipyard-engine
 npm install
 ```
 
-> **Note:** Scoped packages such as `@octokit/graphql` require access to the public npm registry. Ensure your network or npm configuration allows fetching scoped packages. If you see `E403` errors, double-check registry authentication or firewall settings.
-
 ## Environment configuration
 
-Create a `.env` file in the project root with the following keys:
+Copy `.env.example` to `.env` and fill in the values:
 
 ```dotenv
 OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4.1-mini
 GITHUB_TOKEN=ghp_...
-GITHUB_OWNER=your-github-username-or-org
-GITHUB_REPO=target-repo-name
+GITHUB_OWNER=your-github-handle
+GITHUB_REPO=bloom
 GITHUB_BASE_BRANCH=main
 ```
 
-All values are required except `OPENAI_MODEL` (defaults to `gpt-4.1-mini`). The GitHub token must allow creating branches, commits, pull requests, labeling issues, and enabling auto-merge.
+- `OPENAI_MODEL` defaults to `gpt-4.1-mini` if omitted.
+- `GITHUB_REPO` defaults to `bloom`; override when pointing at a different repository.
+- `GITHUB_BASE_BRANCH` defaults to `main`.
+- `GITHUB_OWNER` and `GITHUB_TOKEN` are always required.
 
-## Running the orchestrator
+## Ticket format
 
-Invoke the CLI with an intent string. If no argument is supplied, the sample intent of changing the header brand color to purple is used.
+Tickets can be Markdown or YAML. Provide either YAML front-matter, a fenced `yaml` block, or a `# shipyard:ticket` heading followed by YAML fields. Required keys: `title`, `why`, `scope`, and `dod`. `guardrails` is optional.
+
+Example (`tickets/sample.md`):
+
+```markdown
+# shipyard:ticket
+
+title: "Change header brand color to purple"
+why: "Visual smoke"
+scope:
+  - src/app/layout.tsx
+dod:
+  - "Header link class uses text-purple-500"
+guardrails:
+  - "Touch only files listed in scope"
+```
+
+## Usage
+
+Run via `npm start` or directly with Node. If `--ticket` is omitted, the sample ticket is used.
 
 ```bash
-node orchestrator.js "Replace hero copy with new product tagline"
+npm start -- --ticket tickets/sample.md
+# or
+node orchestrator.js --ticket path/to/ticket.md
 ```
 
-You should see log output similar to:
+### What the engine does
 
-```
-Running intent for howwee20/bloom
-1/5 OpenAI: generating patch
-2/5 GitHub: creating branch …
-3/5 GitHub: creating tree/commit …
-4/5 GitHub: opening PR …
-5/5 GitHub: enabling auto-merge …
-PR ready: https://github.com/howwee20/bloom/pull/123
-Auto-merge enabled; waiting on checks.
-```
+1. Reads and validates the ticket (`1/7 read ticket…`).
+2. Fetches the current contents of each scope file from the base branch (`2/7 fetch scope files…`).
+3. Calls OpenAI with the ticket and file context, enforcing a strict JSON contract (`3/7 call OpenAI…`).
+4. Validates the JSON payload, rejecting paths outside scope, invalid base64, or >5 files (`4/7 validate JSON…`).
+5. Creates a feature branch named `intent-<slug(title)>-<shortid>` (`5/7 create branch…`).
+6. Commits the AI-provided edits with messages prefixed by `shipyard:` (`6/7 commit…`).
+7. Opens a PR, posts the ticket YAML in the body, and attempts to enable auto-merge (`7/7 open PR + arm auto-merge…`).
 
-The final line prints the PR URL with auto-merge enabled. The PR title starts with `shipyard:` and carries the `shipyard-automerge` label.
+On success the CLI prints the PR URL. Auto-merge failures (e.g., repository setting disabled) are logged but do not halt execution.
 
-## Troubleshooting
+## Smoke workflow
 
-| Symptom | Likely cause | Fix |
+The repository includes `.github/workflows/smoke.yml`, a minimal check that always succeeds. Configure branch protection to require this check so auto-merge can arm even if other CI (e.g., Vercel) is unavailable.
+
+## Failure modes & troubleshooting
+
+| Message | Meaning | Fix |
 | --- | --- | --- |
-| `Missing required env var` | A key is absent from `.env` or the shell environment | Populate all required keys and re-run |
-| `E403 403 Forbidden - GET https://registry.npmjs.org/...` when installing | Network policy or npm registry configuration blocking scoped packages | Configure `npm config set registry https://registry.npmjs.org` or supply proper auth/proxy details |
-| `Resource not accessible by integration` from Octokit | Token lacks permission to push branches or enable auto-merge | Use a PAT with `repo` scope or GitHub App installation token with required permissions |
-| `enablePullRequestAutoMerge` mutation returns errors | Repository has auto-merge disabled or token lacks `pull_request:write` scope | Enable auto-merge in repository settings and ensure token scope is sufficient |
+| `Missing required env var` | Required environment variable not set | Populate `.env` or export the variable |
+| `Ticket scope must be a non-empty array` | Ticket missing `scope` entries | Update ticket file |
+| `Scope path not found in base branch` | File listed in scope missing from base branch | Update scope or create file manually |
+| `Scope path is a directory, expected file` | Directory scopes not yet supported | Point to specific files |
+| `JSON invalid` / `Model attempted to modify path outside scope` | OpenAI output rejected by safety checks | Re-run, refine scope, or adjust guardrails |
+| `Branch already exists` | Generated branch name already present | Delete the branch or edit the ticket title |
+| `Auto-merge not enabled: ...` | Repository disallows auto-merge or token lacks scope | Enable auto-merge in repo settings or supply a token with `pull_request:write` |
+| GitHub `403`/`404` errors | Token lacks permissions or repository/branch incorrect | Confirm env vars and token scopes |
 
+## Scripts
+
+- `npm start` – run the orchestrator
+- `npm run tickets:sample` – quick pointer to the bundled ticket example
+
+## Optional scripted merge fallback
+
+Set `USE_SCRIPTED_MERGE=true` and configure `MERGE_CHECK_NAME` when implementing a polling merge fallback. This build does not enable the fallback by default; auto-merge remains the primary path.
