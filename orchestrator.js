@@ -1,273 +1,393 @@
 #!/usr/bin/env node
 
+const fs = require("fs");
+const path = require("path");
 const dotenv = require("dotenv");
+const yaml = require("js-yaml");
 const { nanoid } = require("nanoid");
 const OpenAI = require("openai");
 const { Octokit } = require("@octokit/rest");
 const { graphql } = require("@octokit/graphql");
+const { hideBin } = require("yargs/helpers");
+const yargs = require("yargs/yargs");
 
 dotenv.config();
 
-const SAMPLE_INTENT = "Change header brand color to purple";
-const ALLOWED_DIRECTORIES = ["src/", "app/", "pages/", "styles/"];
+const DEFAULT_TICKET_PATH = "tickets/sample.md";
+const OPENAI_SYSTEM_PROMPT =
+  'Return ONLY JSON: { "files": [ { "path":"…", "contents_base64":"…" } ] } — no prose, no backticks. Touch only files in scope. Minimize edits.';
 const MAX_FILES = 5;
+const MAX_FILE_SIZE = 200 * 1024; // 200KB
 
-function requireEnv(name) {
-  const value = process.env[name];
+function requireEnv(name, fallback) {
+  const value = process.env[name] || fallback;
   if (!value) {
     throw new Error(`Missing required env var: ${name}`);
   }
   return value;
 }
 
-function slugifyIntent(intent) {
-  return intent
+function slugify(value) {
+  return value
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
-    .substring(0, 40) || "intent";
+    .slice(0, 40) || "ticket";
 }
 
-function validateFiles(files) {
-  if (!Array.isArray(files) || files.length === 0) {
-    throw new Error("Model did not return any files to change.");
-  }
-  if (files.length > MAX_FILES) {
-    throw new Error(`Too many files returned (>${MAX_FILES}). Aborting.`);
+function parseTicket(ticketPath) {
+  const raw = fs.readFileSync(ticketPath, "utf8");
+  let ticketBlock = null;
+
+  const frontMatterMatch = raw.match(/^---\n([\s\S]+?)\n---/);
+  if (frontMatterMatch) {
+    ticketBlock = frontMatterMatch[1];
+  } else {
+    const fencedMatch = raw.match(/```(?:yaml)?\n([\s\S]*?)\n```/);
+    if (fencedMatch) {
+      ticketBlock = fencedMatch[1];
+    } else {
+      const headingMatch = raw.match(/#\s*shipyard:ticket[\s\S]*/i);
+      if (headingMatch) {
+        ticketBlock = headingMatch[0].replace(/^#\s*shipyard:ticket\s*/i, "");
+      }
+    }
   }
 
-  for (const file of files) {
-    if (!file || typeof file.path !== "string") {
-      throw new Error("Invalid file entry returned by model.");
+  if (!ticketBlock) {
+    throw new Error("Unable to locate ticket YAML block.");
+  }
+
+  let ticket;
+  try {
+    ticket = yaml.load(ticketBlock);
+  } catch (error) {
+    throw new Error(`Failed to parse ticket YAML: ${error.message}`);
+  }
+
+  if (!ticket || typeof ticket !== "object") {
+    throw new Error("Ticket YAML did not produce an object.");
+  }
+
+  const requiredKeys = ["title", "why", "scope", "dod"];
+  for (const key of requiredKeys) {
+    if (!ticket[key]) {
+      throw new Error(`Ticket missing required field: ${key}`);
     }
-    const normalizedPath = file.path.replace(/\\/g, "/");
-    const isAllowed = ALLOWED_DIRECTORIES.some((dir) =>
-      normalizedPath.startsWith(dir)
+  }
+
+  if (!Array.isArray(ticket.scope) || ticket.scope.length === 0) {
+    throw new Error("Ticket scope must be a non-empty array.");
+  }
+
+  ticket.scope = ticket.scope.map((entry) => {
+    if (typeof entry !== "string" || !entry.trim()) {
+      throw new Error("Ticket scope entries must be non-empty strings.");
+    }
+    const trimmed = entry.trim();
+    const isDirectory = trimmed.endsWith("/");
+    const normalized = path.posix.normalize(
+      isDirectory ? trimmed.replace(/\/+$/, "") : trimmed
     );
-    if (!isAllowed) {
-      throw new Error(
-        `File path '${file.path}' is outside allowed directories (${ALLOWED_DIRECTORIES.join(", ")}).`
-      );
+    if (normalized.startsWith("../")) {
+      throw new Error(`Scope path escapes repository: ${entry}`);
     }
+    const finalPath = normalized.replace(/^\.\//, "");
+    return isDirectory ? `${finalPath}/` : finalPath;
+  });
+
+  if (ticket.guardrails && !Array.isArray(ticket.guardrails)) {
+    throw new Error("Ticket guardrails must be an array when provided.");
   }
+
+  return ticket;
 }
 
-async function getCodeFromAI(intent) {
-  console.log("1/5 OpenAI: generating patch");
-  const client = new OpenAI({ apiKey: requireEnv("OPENAI_API_KEY") });
+async function fetchScopeFiles(octokit, owner, repo, ref, scope) {
+  const files = [];
+  for (const scopePath of scope) {
+    if (scopePath.endsWith("/")) {
+      throw new Error(`Scope path is a directory, expected file: ${scopePath}`);
+    }
+    let response;
+    try {
+      response = await octokit.repos.getContent({
+        owner,
+        repo,
+        path: scopePath,
+        ref,
+      });
+    } catch (error) {
+      if (error.status === 404) {
+        throw new Error(`Scope path not found in base branch: ${scopePath}`);
+      }
+      throw error;
+    }
 
-  const systemInstruction =
-    "Return ONLY a JSON object with 'files' array of {path, contents_base64} representing the minimal set of changed files to fulfill the intent. No backticks, no prose.";
+    if (Array.isArray(response.data)) {
+      throw new Error(`Scope path is a directory, expected file: ${scopePath}`);
+    }
 
-  const userInstruction = `Repository context:\n- Primary UI entry: src/app/layout.tsx\n- Styling: styles/*.css\n- Use minimal diff, least-touch approach.\n\nIntent:\n${intent}`;
+    const { content, encoding, sha } = response.data;
+    if (encoding !== "base64") {
+      throw new Error(`Unexpected encoding for ${scopePath}: ${encoding}`);
+    }
+    const decoded = Buffer.from(content, "base64").toString("utf8");
+    files.push({ path: scopePath, content: decoded, sha });
+  }
+  return files;
+}
 
-  const response = await client.responses.create({
+function buildOpenAIInput(ticket, scopeFiles) {
+  const ticketYaml = yaml.dump(ticket, { lineWidth: 80 });
+  const fileSections = scopeFiles
+    .map((file) => `Path: ${file.path}\n\n${file.content}`)
+    .join("\n\n---\n\n");
+
+  return `Ticket (YAML):\n${ticketYaml}\n\nRepository files in scope:\n${fileSections}`;
+}
+
+function validateModelFiles(modelFiles, scope) {
+  if (!Array.isArray(modelFiles) || modelFiles.length === 0) {
+    throw new Error("JSON response must include at least one file.");
+  }
+  if (modelFiles.length > MAX_FILES) {
+    throw new Error(`Refusing to modify more than ${MAX_FILES} files.`);
+  }
+
+  const normalizedScope = scope.map((scopePath) =>
+    scopePath.endsWith("/") ? scopePath : `${scopePath}`
+  );
+
+  return modelFiles.map((file) => {
+    if (!file || typeof file.path !== "string" || typeof file.contents_base64 !== "string") {
+      throw new Error("Each file entry must include 'path' and 'contents_base64'.");
+    }
+
+    const normalizedPath = path.posix.normalize(file.path.replace(/^\.\//, ""));
+    if (normalizedPath.startsWith("../")) {
+      throw new Error(`File path escapes repository: ${file.path}`);
+    }
+
+    const isWithinScope = normalizedScope.some((scopeEntry) => {
+      if (scopeEntry.endsWith("/")) {
+        return normalizedPath.startsWith(scopeEntry);
+      }
+      return normalizedPath === scopeEntry || normalizedPath.startsWith(`${scopeEntry}/`);
+    });
+
+    if (!isWithinScope) {
+      throw new Error(`Model attempted to modify path outside scope: ${file.path}`);
+    }
+
+    let buffer;
+    try {
+      buffer = Buffer.from(file.contents_base64, "base64");
+    } catch (error) {
+      throw new Error(`Failed to decode base64 for ${file.path}: ${error.message}`);
+    }
+
+    if (!buffer.length) {
+      throw new Error(`Decoded contents empty for ${file.path}.`);
+    }
+
+    if (buffer.length > MAX_FILE_SIZE) {
+      throw new Error(`Decoded contents exceed ${MAX_FILE_SIZE} bytes for ${file.path}.`);
+    }
+
+    return {
+      path: normalizedPath,
+      contents: buffer.toString("utf8"),
+      base64: file.contents_base64,
+    };
+  });
+}
+
+async function callOpenAI(ticket, scopeFiles) {
+  console.log("3/7 call OpenAI…");
+  const openai = new OpenAI({ apiKey: requireEnv("OPENAI_API_KEY") });
+  const input = buildOpenAIInput(ticket, scopeFiles);
+
+  const response = await openai.responses.create({
     model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+    temperature: 0,
+    max_output_tokens: 2048,
     input: [
       {
         role: "system",
-        content: [{ type: "text", text: systemInstruction }],
+        content: [{ type: "text", text: OPENAI_SYSTEM_PROMPT }],
       },
       {
         role: "user",
-        content: [{ type: "text", text: userInstruction }],
+        content: [{ type: "text", text: input }],
       },
     ],
-    temperature: 0.2,
   });
 
-  const outputText =
-    response?.output?.[0]?.content?.[0]?.text || response?.output_text;
-
+  const outputText = response?.output?.[0]?.content?.[0]?.text || response?.output_text;
   if (!outputText) {
-    throw new Error("OpenAI response did not include any text output.");
+    throw new Error("OpenAI response missing text payload.");
   }
 
-  let payload;
+  let json;
   try {
-    payload = JSON.parse(outputText.trim());
+    json = JSON.parse(outputText.trim());
   } catch (error) {
-    throw new Error(`Failed to parse OpenAI JSON response: ${error.message}`);
+    throw new Error(`JSON invalid: ${error.message}`);
   }
 
-  if (!payload || !Array.isArray(payload.files)) {
-    throw new Error("OpenAI response missing 'files' array.");
-  }
-
-  validateFiles(payload.files);
-
-  const files = payload.files.map((file) => {
-    const buffer = Buffer.from(file.contents_base64, "base64");
-    if (!buffer.length) {
-      throw new Error(`File '${file.path}' decoded to empty contents.`);
-    }
-    return {
-      path: file.path.replace(/\\/g, "/"),
-      contents: buffer,
-    };
-  });
-
-  return { files };
+  return validateModelFiles(json.files, ticket.scope);
 }
 
-async function createPRWithAutoMerge({ intent, files }) {
-  const owner = requireEnv("GITHUB_OWNER");
-  const repo = requireEnv("GITHUB_REPO");
-  const baseBranch = requireEnv("GITHUB_BASE_BRANCH");
-  const token = requireEnv("GITHUB_TOKEN");
-
-  if (!files.length) {
-    throw new Error("No files provided for PR.");
+async function ensureBranch(octokit, owner, repo, baseBranch, branchName) {
+  try {
+    await octokit.git.getRef({ owner, repo, ref: `heads/${branchName}` });
+    throw new Error(`Branch already exists: ${branchName}`);
+  } catch (error) {
+    if (error.status !== 404) {
+      throw error;
+    }
   }
 
-  console.log("2/5 GitHub: creating branch …");
-  const octokit = new Octokit({ auth: token });
-
-  const baseRef = await octokit.git.getRef({
-    owner,
-    repo,
-    ref: `heads/${baseBranch}`,
-  });
-
-  const baseSha = baseRef.data.object.sha;
-
-  const baseCommit = await octokit.git.getCommit({
-    owner,
-    repo,
-    commit_sha: baseSha,
-  });
-
-  const baseTreeSha = baseCommit.data.tree.sha;
-
-  const intentSlug = slugifyIntent(intent);
-  const branchName = `intent-${intentSlug}-${nanoid(6)}`;
-
+  const baseRef = await octokit.git.getRef({ owner, repo, ref: `heads/${baseBranch}` });
   await octokit.git.createRef({
     owner,
     repo,
     ref: `refs/heads/${branchName}`,
-    sha: baseSha,
+    sha: baseRef.data.object.sha,
   });
+}
 
-  console.log("3/5 GitHub: creating tree/commit …");
+async function commitFiles(octokit, owner, repo, branchName, files, scopeFiles) {
+  console.log("6/7 commit…");
+  const shaLookup = new Map(scopeFiles.map((file) => [file.path, file.sha]));
+  const message = `shipyard: ${files.map((f) => f.path).join(", ")}`;
 
-  const blobs = await Promise.all(
-    files.map((file) =>
-      octokit.git.createBlob({
-        owner,
-        repo,
-        content: file.contents.toString("base64"),
-        encoding: "base64",
-      })
-    )
-  );
+  for (const file of files) {
+    const existingSha = shaLookup.get(file.path);
+    await octokit.repos.createOrUpdateFileContents({
+      owner,
+      repo,
+      path: file.path,
+      message,
+      content: file.base64,
+      branch: branchName,
+      sha: existingSha,
+      committer: {
+        name: "shipyard-bot",
+        email: "shipyard@example.com",
+      },
+      author: {
+        name: "shipyard-bot",
+        email: "shipyard@example.com",
+      },
+    });
+  }
+}
 
-  const treeItems = files.map((file, index) => ({
-    path: file.path,
-    mode: "100644",
-    type: "blob",
-    sha: blobs[index].data.sha,
-  }));
+function buildPrBody(ticket) {
+  const ticketYaml = yaml.dump(ticket, { lineWidth: 80 });
+  return [
+    "## Ticket",
+    "```yaml",
+    ticketYaml.trim(),
+    "```",
+  ].join("\n");
+}
 
-  const newTree = await octokit.git.createTree({
-    owner,
-    repo,
-    base_tree: baseTreeSha,
-    tree: treeItems,
-  });
+async function openPrAndEnableAutoMerge(octokit, ticket, branchName, baseBranch, owner, repo) {
+  console.log("7/7 open PR + arm auto-merge…");
+  const prTitle = `shipyard: ${ticket.title}`;
+  const body = buildPrBody(ticket);
 
-  const commit = await octokit.git.createCommit({
-    owner,
-    repo,
-    message: `shipyard: ${intentSlug}`,
-    tree: newTree.data.sha,
-    parents: [baseSha],
-  });
-
-  await octokit.git.updateRef({
-    owner,
-    repo,
-    ref: `heads/${branchName}`,
-    sha: commit.data.sha,
-    force: false,
-  });
-
-  console.log("4/5 GitHub: opening PR …");
-
-  const prTitle = `shipyard: ${intentSlug}`;
-  const prBody = `Intent:\n\n${intent}`;
-
-  const pullRequest = await octokit.pulls.create({
+  const pr = await octokit.pulls.create({
     owner,
     repo,
     title: prTitle,
     head: branchName,
     base: baseBranch,
-    body: prBody,
+    body,
   });
-
-  await octokit.issues.addLabels({
-    owner,
-    repo,
-    issue_number: pullRequest.data.number,
-    labels: ["shipyard-automerge"],
-  });
-
-  console.log("5/5 GitHub: enabling auto-merge …");
 
   const gql = graphql.defaults({
     headers: {
-      authorization: `token ${token}`,
+      authorization: `token ${requireEnv("GITHUB_TOKEN")}`,
     },
   });
 
-  await gql(
-    `mutation EnableAutoMerge($pullRequestId: ID!, $method: PullRequestMergeMethod!) {
-      enablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId, mergeMethod: $method }) {
-        clientMutationId
+  try {
+    await gql(
+      `mutation EnableAutoMerge($pullRequestId: ID!, $method: PullRequestMergeMethod!) {
+        enablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId, mergeMethod: $method }) {
+          clientMutationId
+        }
+      }`,
+      {
+        pullRequestId: pr.data.node_id,
+        method: "SQUASH",
       }
-    }`,
-    {
-      pullRequestId: pullRequest.data.node_id,
-      method: "SQUASH",
-    }
-  );
+    );
+  } catch (error) {
+    console.warn(`Auto-merge not enabled: ${error.message}`);
+  }
 
-  console.log(`PR ready: ${pullRequest.data.html_url}`);
-  console.log("Auto-merge enabled; waiting on checks.");
-
-  return pullRequest.data.html_url;
+  console.log(`PR ready: ${pr.data.html_url}`);
+  return pr.data.html_url;
 }
 
-async function runIntent(intent) {
-  try {
-    const owner = requireEnv("GITHUB_OWNER");
-    const repo = requireEnv("GITHUB_REPO");
-    if (!intent || typeof intent !== "string") {
-      throw new Error("Intent must be a non-empty string.");
-    }
+async function run() {
+  const argv = yargs(hideBin(process.argv))
+    .option("ticket", {
+      type: "string",
+      describe: "Path to ticket file (Markdown or YAML)",
+    })
+    .help()
+    .parse();
 
-    console.log(`Running intent for ${owner}/${repo}`);
-
-    const { files } = await getCodeFromAI(intent);
-
-    const prUrl = await createPRWithAutoMerge({ intent, files });
-
-    console.log(`Completed. PR URL: ${prUrl}`);
-  } catch (error) {
-    console.error(error.message);
-    process.exitCode = 1;
+  console.log("1/7 read ticket…");
+  const ticketPath = argv.ticket || DEFAULT_TICKET_PATH;
+  const absoluteTicketPath = path.resolve(ticketPath);
+  if (!fs.existsSync(absoluteTicketPath)) {
+    throw new Error(`Ticket file not found: ${ticketPath}`);
   }
+
+  const ticket = parseTicket(absoluteTicketPath);
+
+  const owner = requireEnv("GITHUB_OWNER");
+  const repo = requireEnv("GITHUB_REPO", "bloom");
+  const baseBranch = requireEnv("GITHUB_BASE_BRANCH", "main");
+  const githubToken = requireEnv("GITHUB_TOKEN");
+
+  const octokit = new Octokit({ auth: githubToken });
+
+  console.log("2/7 fetch scope files…");
+  const scopeFiles = await fetchScopeFiles(octokit, owner, repo, baseBranch, ticket.scope);
+
+  const modelFiles = await callOpenAI(ticket, scopeFiles);
+
+  console.log("4/7 validate JSON…");
+  // callOpenAI already validates, so this log acknowledges completion.
+
+  console.log("5/7 create branch…");
+  const branchName = `intent-${slugify(ticket.title)}-${nanoid(6)}`;
+  await ensureBranch(octokit, owner, repo, baseBranch, branchName);
+
+  await commitFiles(octokit, owner, repo, branchName, modelFiles, scopeFiles);
+
+  await openPrAndEnableAutoMerge(octokit, ticket, branchName, baseBranch, owner, repo);
 }
 
 if (require.main === module) {
-  const intentFromArgs = process.argv.slice(2).join(" ");
-  const intent = intentFromArgs || SAMPLE_INTENT;
-  runIntent(intent);
+  run().catch((error) => {
+    console.error(error.message || error);
+    process.exitCode = 1;
+  });
 }
 
 module.exports = {
-  getCodeFromAI,
-  createPRWithAutoMerge,
-  runIntent,
+  parseTicket,
+  fetchScopeFiles,
+  callOpenAI,
+  validateModelFiles,
+  run,
 };
