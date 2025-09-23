@@ -16,6 +16,7 @@ dotenv.config();
 const DEFAULT_TICKET_PATH = "tickets/sample.md";
 const MAX_FILES = 5;
 const MAX_FILE_SIZE = 200 * 1024; // 200KB
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function requireEnv(name, fallback) {
   const value = process.env[name] || fallback;
@@ -310,6 +311,7 @@ async function openPrAndEnableAutoMerge(octokit, ticket, branchName, baseBranch,
     },
   });
 
+  let autoMergeEnabled = true;
   try {
     await gql(
       `mutation EnableAutoMerge(
@@ -325,10 +327,60 @@ async function openPrAndEnableAutoMerge(octokit, ticket, branchName, baseBranch,
     );
   } catch (e) {
     console.warn(`Auto-merge not enabled: ${e.message}`);
+    autoMergeEnabled = false;
   }
 
   console.log(`PR ready: ${pr.data.html_url}`);
-  return pr.data.html_url;
+  return {
+    url: pr.data.html_url,
+    number: pr.data.number,
+    headSha: pr.data.head.sha,
+    autoMergeEnabled,
+  };
+}
+
+async function waitForCheck(octokit, owner, repo, sha, options = {}) {
+  const { nameSubstr = "Vercel", timeoutMs = 900000, intervalMs = 5000 } = options;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() <= deadline) {
+    const response = await octokit.checks.listForRef({
+      owner,
+      repo,
+      ref: sha,
+      per_page: 100,
+    });
+    const checkRuns = response.data.check_runs || [];
+    const match = checkRuns.find((run) => run.name && run.name.includes(nameSubstr));
+
+    if (match) {
+      if (match.status === "completed") {
+        return match;
+      }
+    }
+
+    await delay(intervalMs);
+  }
+
+  return null;
+}
+
+async function mergePr(octokit, owner, repo, number) {
+  await octokit.pulls.merge({
+    owner,
+    repo,
+    pull_number: number,
+    merge_method: "squash",
+  });
+}
+
+async function commentPr(octokit, owner, repo, number, body) {
+  await octokit.issues.createComment({
+    owner,
+    repo,
+    issue_number: number,
+    body,
+  });
 }
 
 async function run() {
@@ -370,7 +422,52 @@ async function run() {
 
   await commitFiles(octokit, owner, repo, branchName, modelFiles, scopeFiles);
 
-  await openPrAndEnableAutoMerge(octokit, ticket, branchName, baseBranch, owner, repo);
+  const prInfo = await openPrAndEnableAutoMerge(
+    octokit,
+    ticket,
+    branchName,
+    baseBranch,
+    owner,
+    repo
+  );
+
+  const useScriptedMerge =
+    (process.env.USE_SCRIPTED_MERGE || "").toLowerCase() === "true";
+
+  if (useScriptedMerge || !prInfo.autoMergeEnabled) {
+    console.log("Scripted merge fallback: waiting for required check…");
+    const checkNameSubstr = "Vercel";
+    try {
+      const check = await waitForCheck(
+        octokit,
+        owner,
+        repo,
+        prInfo.headSha,
+        { nameSubstr: checkNameSubstr }
+      );
+      const conclusion = check?.conclusion || "timeout";
+
+      if (conclusion === "success") {
+        console.log("Scripted merge fallback: check succeeded, merging PR…");
+        await mergePr(octokit, owner, repo, prInfo.number);
+        console.log("Scripted merge fallback: PR merged via scripted flow.");
+      } else {
+        const checkName = check?.name || checkNameSubstr;
+        console.log(
+          `Scripted merge fallback: check concluded '${conclusion}', commenting.`
+        );
+        await commentPr(
+          octokit,
+          owner,
+          repo,
+          prInfo.number,
+          `Shipyard: required check '${checkName}' concluded: ${conclusion}. Not merging.`
+        );
+      }
+    } catch (error) {
+      console.warn(`Scripted merge fallback error: ${error.message}`);
+    }
+  }
 }
 
 if (require.main === module) {
@@ -385,5 +482,8 @@ module.exports = {
   fetchScopeFiles,
   callOpenAI,
   validateModelFiles,
+  waitForCheck,
+  mergePr,
+  commentPr,
   run,
 };
