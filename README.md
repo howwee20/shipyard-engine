@@ -30,6 +30,7 @@ ANTHROPIC_API_KEY=
 ANTHROPIC_MODEL=claude-3-5-sonnet-latest
 ANTHROPIC_VERSION=2023-06-01
 ANTHROPIC_BASE_URL=https://api.anthropic.com
+ANTHROPIC_MAX_TOKENS=4000
 GITHUB_TOKEN=ghp_...
 GITHUB_OWNER=your-github-handle
 GITHUB_REPO=bloom
@@ -43,6 +44,7 @@ VERIFY_STRICT=true
 - `GITHUB_OWNER` and `GITHUB_TOKEN` are always required.
 - `LLM_PROVIDER` defaults to `openai`; set to `anthropic` to use Claude instead.
 - When `LLM_PROVIDER=anthropic`, provide `ANTHROPIC_API_KEY` and optionally override `ANTHROPIC_MODEL`, `ANTHROPIC_VERSION`, or `ANTHROPIC_BASE_URL`.
+- `ANTHROPIC_MAX_TOKENS` defaults to `4000`, is clamped between `256` and Anthropic's `32000` hard limit, and governs Claude's response length; 2–8k tokens is ample for typical `{files:[...]}` diffs.
 - `VERIFY_STRICT` controls the Sanity Rails check (see below) and should remain `true` unless you fully trust downstream safeguards.
 
 ## LLM provider switch
