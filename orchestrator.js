@@ -255,6 +255,8 @@ async function callAnthropic(ticket, scopeFiles) {
   const baseUrl = (process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com").replace(/\/$/, "");
   const version = process.env.ANTHROPIC_VERSION || "2023-06-01";
   const model = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-latest";
+  const maxTokens = Number(process.env.ANTHROPIC_MAX_TOKENS || 4000);
+  const clampedTokens = Math.max(256, Math.min(maxTokens, 32000));
 
   const system = buildSystemPrompt();
   const user = buildOpenAIInput(ticket, scopeFiles);
@@ -269,7 +271,7 @@ async function callAnthropic(ticket, scopeFiles) {
     body: JSON.stringify({
       model,
       temperature: 0,
-      max_tokens: 200000,
+      max_tokens: clampedTokens,
       system,
       messages: [{ role: "user", content: user }],
     }),
