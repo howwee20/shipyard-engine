@@ -6,6 +6,7 @@ const dotenv = require("dotenv");
 const yaml = require("js-yaml");
 const { nanoid } = require("nanoid");
 const OpenAI = require("openai");
+const fetch = require("node-fetch");
 const { Octokit } = require("@octokit/rest");
 const { graphql } = require("@octokit/graphql");
 const { hideBin } = require("yargs/helpers");
@@ -202,15 +203,19 @@ function validateModelFiles(modelFiles, scope) {
   });
 }
 
-async function callOpenAI(ticket, scopeFiles) {
-  const apiKey = requireEnv("OPENAI_API_KEY");
-  const openai = new OpenAI({ apiKey });
-
-  const system = [
+function buildSystemPrompt() {
+  return [
     "You edit code for surgical tickets.",
     'Return ONLY JSON exactly: {"files":[{"path":"...","contents_base64":"..."}]}',
     "Touch ONLY files in scope. Keep edits minimal. No prose. No backticks.",
   ].join("\n");
+}
+
+async function callOpenAI(ticket, scopeFiles) {
+  const apiKey = requireEnv("OPENAI_API_KEY");
+  const openai = new OpenAI({ apiKey });
+
+  const system = buildSystemPrompt();
 
   const user = buildOpenAIInput(ticket, scopeFiles);
 
@@ -233,6 +238,205 @@ async function callOpenAI(ticket, scopeFiles) {
 
   const files = validateModelFiles(parsed.files, ticket.scope);
   return files;
+}
+
+async function callAnthropic(ticket, scopeFiles) {
+  const apiKey = requireEnv("ANTHROPIC_API_KEY");
+  const baseUrl = (process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com").replace(/\/$/, "");
+  const version = process.env.ANTHROPIC_VERSION || "2023-06-01";
+  const model = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-latest";
+
+  const system = buildSystemPrompt();
+  const user = buildOpenAIInput(ticket, scopeFiles);
+
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": version,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0,
+      max_tokens: 200000,
+      system,
+      messages: [{ role: "user", content: user }],
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Anthropic request failed: ${response.status} ${text}`);
+  }
+
+  const data = await response.json();
+  const text = data?.content?.[0]?.text?.trim() || "";
+  if (!text) {
+    throw new Error("Anthropic response missing content.");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("Model did not return valid JSON.");
+  }
+
+  const files = validateModelFiles(parsed.files, ticket.scope);
+  return files;
+}
+
+async function callLLM(ticket, scopeFiles) {
+  const provider = (process.env.LLM_PROVIDER || "openai").toLowerCase();
+  if (provider === "anthropic") {
+    return callAnthropic(ticket, scopeFiles);
+  }
+  if (provider === "openai") {
+    return callOpenAI(ticket, scopeFiles);
+  }
+  throw new Error(`Unsupported LLM provider: ${provider}`);
+}
+
+function safeReplace(ticket, scopeFiles) {
+  const replacements = Array.isArray(ticket.safe_replace)
+    ? ticket.safe_replace
+    : [];
+
+  if (replacements.length === 0) {
+    throw new Error("SafeReplace requires at least one replacement entry.");
+  }
+
+  const scopeMap = new Map(
+    scopeFiles.map((file) => [path.posix.normalize(file.path), file])
+  );
+
+  const normalizedScope = ticket.scope.map((scopePath) =>
+    scopePath.endsWith("/") ? scopePath : `${scopePath}`
+  );
+
+  const files = [];
+
+  for (const entry of replacements) {
+    if (!entry || typeof entry.path !== "string") {
+      throw new Error("SafeReplace entries require a 'path' string.");
+    }
+
+    const normalizedPath = path.posix.normalize(entry.path.replace(/^\.\//, ""));
+    if (normalizedPath.startsWith("../")) {
+      throw new Error(`SafeReplace path escapes repository: ${entry.path}`);
+    }
+
+    const isWithinScope = normalizedScope.some((scopeEntry) => {
+      if (scopeEntry.endsWith("/")) {
+        return normalizedPath.startsWith(scopeEntry);
+      }
+      return (
+        normalizedPath === scopeEntry || normalizedPath.startsWith(`${scopeEntry}/`)
+      );
+    });
+
+    if (!isWithinScope) {
+      throw new Error(`SafeReplace path outside scope: ${entry.path}`);
+    }
+
+    const scopeFile = scopeMap.get(normalizedPath);
+    if (!scopeFile) {
+      throw new Error(`SafeReplace path not found in scope files: ${entry.path}`);
+    }
+
+    if (!Array.isArray(entry.replacements) || entry.replacements.length === 0) {
+      continue;
+    }
+
+    let content = scopeFile.content;
+    let modified = false;
+
+    for (const replacement of entry.replacements) {
+      if (
+        !replacement ||
+        typeof replacement.find !== "string" ||
+        typeof replacement.replace !== "string"
+      ) {
+        throw new Error(
+          "SafeReplace replacements require 'find' and 'replace' strings."
+        );
+      }
+
+      if (!content.includes(replacement.find)) {
+        console.log(
+          `SafeReplace: token not found in ${normalizedPath}: ${replacement.find}`
+        );
+        continue;
+      }
+
+      content = content.split(replacement.find).join(replacement.replace);
+      modified = true;
+    }
+
+    if (modified && content !== scopeFile.content) {
+      files.push({
+        path: normalizedPath,
+        contents_base64: Buffer.from(content, "utf8").toString("base64"),
+      });
+    }
+  }
+
+  if (files.length === 0) {
+    throw new Error("SafeReplace made no changes.");
+  }
+
+  return validateModelFiles(files, ticket.scope);
+}
+
+function runSanityRails(files) {
+  for (const file of files) {
+    const text = file.contents;
+    const pathName = file.path;
+
+    const size = Buffer.byteLength(text, "utf8");
+    if (!size || size > 200000) {
+      console.error(
+        `SanityRails: ${pathName} failed size check (${size} bytes)`
+      );
+      throw new Error("SanityRails failure");
+    }
+
+    for (let i = 0; i < text.length; i += 1) {
+      const code = text.charCodeAt(i);
+      const isAllowed =
+        code === 9 ||
+        code === 10 ||
+        code === 13 ||
+        (code >= 32 && code <= 126);
+      if (!isAllowed) {
+        console.error(
+          `SanityRails: ${pathName} failed non-printable character check`
+        );
+        throw new Error("SanityRails failure");
+      }
+    }
+
+    if (
+      pathName.endsWith("src/app/layout.tsx") &&
+      !text.includes("export default function RootLayout(")
+    ) {
+      console.error(
+        `SanityRails: ${pathName} failed RootLayout export assertion`
+      );
+      throw new Error("SanityRails failure");
+    }
+
+    if (
+      pathName.endsWith("NowPlaying.tsx") &&
+      !text.includes("export default function NowPlaying")
+    ) {
+      console.error(
+        `SanityRails: ${pathName} failed NowPlaying export assertion`
+      );
+      throw new Error("SanityRails failure");
+    }
+  }
 }
 
 async function ensureBranch(octokit, owner, repo, baseBranch, branchName) {
@@ -411,10 +615,23 @@ async function run() {
   console.log("2/7 fetch scope files…");
   const scopeFiles = await fetchScopeFiles(octokit, owner, repo, baseBranch, ticket.scope);
 
-  console.log("3/7 call OpenAI…");
-  const modelFiles = await callOpenAI(ticket, scopeFiles);
+  let modelFiles;
+  if (Array.isArray(ticket.safe_replace) && ticket.safe_replace.length > 0) {
+    console.log("3/7 safe replace…");
+    modelFiles = safeReplace(ticket, scopeFiles);
+  } else {
+    console.log("3/7 call LLM…");
+    modelFiles = await callLLM(ticket, scopeFiles);
+  }
 
-  console.log("4/7 validate JSON…");
+  const verifyStrict =
+    (process.env.VERIFY_STRICT || "true").toLowerCase() !== "false";
+  if (verifyStrict) {
+    console.log("4/7 run sanity rails…");
+    runSanityRails(modelFiles);
+  } else {
+    console.log("4/7 run sanity rails… (skipped, VERIFY_STRICT=false)");
+  }
 
   console.log("5/7 create branch…");
   const branchName = `intent-${slugify(ticket.title)}-${nanoid(6)}`;
@@ -481,7 +698,11 @@ module.exports = {
   parseTicket,
   fetchScopeFiles,
   callOpenAI,
+  callAnthropic,
+  callLLM,
+  safeReplace,
   validateModelFiles,
+  runSanityRails,
   waitForCheck,
   mergePr,
   commentPr,
