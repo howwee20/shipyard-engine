@@ -17,7 +17,12 @@
     "dotenv": "^16.4.5",
     "js-yaml": "^4.1.0",
     "nanoid": "^5.0.7",
+    "node-fetch": "^2.7.0",
     "openai": "^4.52.0",
     "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.5"
   }
 }
