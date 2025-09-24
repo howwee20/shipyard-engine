@@ -29,6 +29,17 @@ const NOW_PLAYING_EXPORT_ANCHORS = [
   "export default memo(NowPlaying)",
 ];
 
+const COLOR_PRESET_COLORS = ["red", "orange", "pink", "purple", "green"];
+const COLOR_PRESET_KIND_SET = new Set([
+  "text",
+  "hover:text",
+  "bg",
+  "hover:bg",
+  "active:bg",
+  "focus-visible:ring",
+]);
+const COLOR_PRESET_SHADE_SET = new Set(["500", "600", "700"]);
+
 function requireEnv(name, fallback) {
   const value = process.env[name] || fallback;
   if (!value) {
@@ -310,6 +321,92 @@ async function callLLM(ticket, scopeFiles) {
   throw new Error(`Unsupported LLM provider: ${provider}`);
 }
 
+function buildColorPresetReplacements(preset) {
+  if (!preset || typeof preset !== "object") {
+    return [];
+  }
+
+  const target = String(preset.target || "").trim();
+  if (!target) {
+    throw new Error("color_preset requires a 'target' color.");
+  }
+  if (!COLOR_PRESET_COLORS.includes(target)) {
+    throw new Error(
+      `color_preset target must be one of: ${COLOR_PRESET_COLORS.join(", ")}`
+    );
+  }
+
+  const kinds = Array.isArray(preset.kinds) && preset.kinds.length > 0
+    ? preset.kinds
+    : ["text"];
+
+  const shades = Array.isArray(preset.shades) && preset.shades.length > 0
+    ? preset.shades
+    : [500];
+
+  const replacements = [];
+
+  for (const rawKind of kinds) {
+    const kind = String(rawKind || "").trim();
+    if (!COLOR_PRESET_KIND_SET.has(kind)) {
+      throw new Error(
+        `color_preset kind must be one of: ${Array.from(
+          COLOR_PRESET_KIND_SET
+        ).join(", ")}`
+      );
+    }
+
+    for (const rawShade of shades) {
+      const shade = String(rawShade || "").trim();
+      if (!COLOR_PRESET_SHADE_SET.has(shade)) {
+        throw new Error(
+          `color_preset shades must be within: ${Array.from(
+            COLOR_PRESET_SHADE_SET
+          ).join(", ")}`
+        );
+      }
+
+      const find_any = Array.from(
+        new Set(
+          COLOR_PRESET_COLORS.map(
+            (color) => `${kind}-${color}-${shade}`
+          )
+        )
+      );
+      const replace = `${kind}-${target}-${shade}`;
+      replacements.push({ find_any, replace });
+    }
+  }
+
+  return replacements;
+}
+
+function applyColorPresets(replacements) {
+  return replacements.map((entry) => {
+    if (!entry || typeof entry !== "object") {
+      return entry;
+    }
+
+    if (
+      Array.isArray(entry.replacements) &&
+      entry.replacements.length > 0
+    ) {
+      return entry;
+    }
+
+    if (!entry.color_preset) {
+      return entry;
+    }
+
+    const generated = buildColorPresetReplacements(entry.color_preset);
+    if (!generated.length) {
+      return entry;
+    }
+
+    return { ...entry, replacements: generated };
+  });
+}
+
 function safeReplace(ticket, scopeFiles) {
   const replacements = Array.isArray(ticket.safe_replace)
     ? ticket.safe_replace
@@ -318,6 +415,8 @@ function safeReplace(ticket, scopeFiles) {
   if (replacements.length === 0) {
     throw new Error("SafeReplace requires at least one replacement entry.");
   }
+
+  const expandedReplacements = applyColorPresets(replacements);
 
   const scopeMap = new Map(
     scopeFiles.map((file) => [path.posix.normalize(file.path), file])
@@ -329,7 +428,7 @@ function safeReplace(ticket, scopeFiles) {
 
   const files = [];
 
-  for (const entry of replacements) {
+  for (const entry of expandedReplacements) {
     if (!entry || typeof entry.path !== "string") {
       throw new Error("SafeReplace entries require a 'path' string.");
     }
@@ -361,49 +460,116 @@ function safeReplace(ticket, scopeFiles) {
       continue;
     }
 
-    let content = scopeFile.content;
+    const originalContent = scopeFile.content;
+    let content = originalContent;
     let modified = false;
     let replacementCount = 0;
+    const searchedTokens = new Set();
 
     for (const replacement of entry.replacements) {
-      if (
-        !replacement ||
-        typeof replacement.find !== "string" ||
-        typeof replacement.replace !== "string"
-      ) {
+      if (!replacement || typeof replacement !== "object") {
         throw new Error(
-          "SafeReplace replacements require 'find' and 'replace' strings."
+          "SafeReplace replacements require a replacement object."
         );
       }
 
-      const segments = content.split(replacement.find);
-      if (segments.length === 1) {
-        console.log(
-          `SafeReplace: token not found ${replacement.find} in ${normalizedPath}`
+      const replaceValue = replacement.replace;
+      if (typeof replaceValue !== "string") {
+        throw new Error(
+          "SafeReplace replacements require a 'replace' string."
         );
+      }
+
+      if (typeof replacement.find === "string") {
+        searchedTokens.add(replacement.find);
+        const segments = content.split(replacement.find);
+        if (segments.length === 1) {
+          console.log(
+            `SafeReplace: token not found ${replacement.find} in ${normalizedPath}`
+          );
+          continue;
+        }
+
+        const occurrences = segments.length - 1;
+        content = segments.join(replaceValue);
+        if (occurrences > 0) {
+          modified = true;
+          replacementCount += occurrences;
+        }
         continue;
       }
 
-      const occurrences = segments.length - 1;
-      content = segments.join(replacement.replace);
-      modified = true;
-      replacementCount += occurrences;
+      if (Array.isArray(replacement.find_any)) {
+        const tokenList = replacement.find_any
+          .map((token) => String(token || "").trim())
+          .filter((token) => token.length > 0);
+
+        if (tokenList.length === 0) {
+          throw new Error(
+            "SafeReplace replacements require non-empty 'find_any' strings."
+          );
+        }
+
+        for (const token of tokenList) {
+          searchedTokens.add(token);
+        }
+
+        let chosenToken = null;
+        let chosenIndex = Infinity;
+        for (const token of tokenList) {
+          const index = content.indexOf(token);
+          if (index !== -1 && index < chosenIndex) {
+            chosenToken = token;
+            chosenIndex = index;
+          }
+        }
+
+        if (!chosenToken) {
+          console.log(
+            `SafeReplace: token not found (any of ${tokenList.join(", ")}) in ${normalizedPath}`
+          );
+          continue;
+        }
+
+        const segments = content.split(chosenToken);
+        const occurrences = segments.length - 1;
+        content = segments.join(replaceValue);
+        if (occurrences > 0) {
+          modified = true;
+          replacementCount += occurrences;
+        }
+        continue;
+      }
+
+      throw new Error(
+        "SafeReplace replacements require either 'find' or 'find_any'."
+      );
     }
 
-    console.log(
-      `SafeReplace: replaced ${replacementCount} token(s) in ${normalizedPath}`
-    );
-
-    if (modified && content !== scopeFile.content) {
+    if (modified && content !== originalContent) {
+      console.log(
+        `SafeReplace: replaced ${replacementCount} token(s) in ${normalizedPath}`
+      );
       files.push({
         path: normalizedPath,
         contents_base64: Buffer.from(content, "utf8").toString("base64"),
       });
+    } else {
+      const tokenSummary = Array.from(searchedTokens);
+      if (tokenSummary.length > 0) {
+        console.log(
+          `SafeReplace: no changes in ${normalizedPath}. Searched: ${tokenSummary.join(", ")}`
+        );
+      } else {
+        console.log(
+          `SafeReplace: no changes in ${normalizedPath}. Searched: (none)`
+        );
+      }
     }
   }
 
   if (files.length === 0) {
-    throw new Error("SafeReplace made no changes.");
+    return [];
   }
 
   return validateModelFiles(files, ticket.scope);
@@ -631,6 +797,10 @@ async function run() {
   if (Array.isArray(ticket.safe_replace) && ticket.safe_replace.length > 0) {
     console.log("3/7 safe replace…");
     modelFiles = safeReplace(ticket, scopeFiles);
+    if (modelFiles.length === 0) {
+      console.log("SafeReplace: no files modified; exiting early.");
+      return;
+    }
   } else {
     console.log("3/7 call LLM…");
     modelFiles = await callLLM(ticket, scopeFiles);

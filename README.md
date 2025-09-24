@@ -75,6 +75,38 @@ safe_replace:
 
 If any `find` token is missing the engine logs the omission and leaves the file untouched. When at least one replacement succeeds, the updated files continue through the normal validation, commit, and PR flow.
 
+### `find_any`
+
+When you do not know which of several tokens exists in a file, use `find_any` to provide a list of acceptable matches. The engine scans the file once, picks the first token that actually appears, and replaces every occurrence of that token with the provided `replace` string:
+
+```yaml
+safe_replace:
+  - path: src/app/layout.tsx
+    replacements:
+      - find_any:
+          - "text-red-500"
+          - "text-orange-500"
+          - "text-green-500"
+        replace: "text-purple-500"
+```
+
+Tokens that are not present are reported in the logs, and a file that ends with zero net changes emits `SafeReplace: no changes in <path>. Searched: <tokens>` instead of aborting the run.
+
+### Color presets
+
+Tickets can also request simple Tailwind color swaps without enumerating every combination. Provide a `color_preset` block **instead of** explicit replacements and the orchestrator expands it into the corresponding `find_any` pairs. Supported colors: `red`, `orange`, `pink`, `purple`, `green`. Supported kinds: `text`, `hover:text`, `bg`, `hover:bg`, `active:bg`, `focus-visible:ring`. Supported shades: `500`, `600`, `700`.
+
+```yaml
+safe_replace:
+  - path: src/app/layout.tsx
+    color_preset:
+      target: purple
+      kinds: ["text", "hover:text"]
+      shades: [500, 600]
+```
+
+The preset above expands to normalized replacements that search for any `text-*`/`hover:text-*` classes at the listed shades and convert them to `purple`. It is perfect for a header link that should use `text-500` and `hover:text-600` variants without caring whether the current palette is red, orange, pink, or green—the helper finds the first match and normalizes every occurrence to purple.
+
 ## Sanity Rails
 
 Before committing, the engine runs a strict sanity check on every modified file (unless `VERIFY_STRICT=false`). It rejects updates that are empty, exceed 200 KB, contain disallowed control characters, or strip required exports from `src/app/layout.tsx` or `src/app/components/NowPlaying.tsx`. Failures abort the run with a `SanityRails` error message—only disable the guardrail if you have redundant protections downstream.
@@ -83,7 +115,7 @@ The non-printable filter blocks characters that match `/[\u0000-\u0008\u000B\u00
 
 `src/app/layout.tsx` passes when it contains either `export default function RootLayout(` or `export default RootLayout`. `src/app/components/NowPlaying.tsx` passes when it contains any of `export default function NowPlaying`, `export default NowPlaying`, or `export default memo(NowPlaying)`.
 
-SafeReplace emits informational messages when a `find` token is missing (e.g., `SafeReplace: token not found <token> in <path>`) and logs how many tokens it actually replaces per file; these messages do not fail the run.
+SafeReplace emits informational messages when a `find` token is missing (e.g., `SafeReplace: token not found <token> in <path>`), when no acceptable token from a `find_any` list appears, and when a file ends with no modifications. These messages do not fail the run.
 
 ## Ticket format
 
