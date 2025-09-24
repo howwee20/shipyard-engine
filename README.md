@@ -75,7 +75,13 @@ If any `find` token is missing the engine logs the omission and leaves the file 
 
 ## Sanity Rails
 
-Before committing, the engine runs a strict sanity check on every modified file (unless `VERIFY_STRICT=false`). It rejects updates that are empty, exceed 200 KB, contain non-printable bytes, or strip required exports from `src/app/layout.tsx` or `NowPlaying.tsx`. Failures abort the run with a `SanityRails` error message—only disable the guardrail if you have redundant protections downstream.
+Before committing, the engine runs a strict sanity check on every modified file (unless `VERIFY_STRICT=false`). It rejects updates that are empty, exceed 200 KB, contain disallowed control characters, or strip required exports from `src/app/layout.tsx` or `src/app/components/NowPlaying.tsx`. Failures abort the run with a `SanityRails` error message—only disable the guardrail if you have redundant protections downstream.
+
+The non-printable filter blocks characters that match `/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uFFFD]/`, allowing normal UTF-8 while guarding against control characters and the Unicode replacement glyph.
+
+`src/app/layout.tsx` passes when it contains either `export default function RootLayout(` or `export default RootLayout`. `src/app/components/NowPlaying.tsx` passes when it contains any of `export default function NowPlaying`, `export default NowPlaying`, or `export default memo(NowPlaying)`.
+
+SafeReplace emits informational messages when a `find` token is missing (e.g., `SafeReplace: token not found <token> in <path>`) and logs how many tokens it actually replaces per file; these messages do not fail the run.
 
 ## Ticket format
 

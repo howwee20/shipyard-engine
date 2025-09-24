@@ -18,6 +18,16 @@ const DEFAULT_TICKET_PATH = "tickets/sample.md";
 const MAX_FILES = 5;
 const MAX_FILE_SIZE = 200 * 1024; // 200KB
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const SANITY_RAILS_INVALID_CHAR_REGEX = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uFFFD]/;
+const ROOT_LAYOUT_EXPORT_ANCHORS = [
+  "export default function RootLayout(",
+  "export default RootLayout",
+];
+const NOW_PLAYING_EXPORT_ANCHORS = [
+  "export default function NowPlaying",
+  "export default NowPlaying",
+  "export default memo(NowPlaying)",
+];
 
 function requireEnv(name, fallback) {
   const value = process.env[name] || fallback;
@@ -351,6 +361,7 @@ function safeReplace(ticket, scopeFiles) {
 
     let content = scopeFile.content;
     let modified = false;
+    let replacementCount = 0;
 
     for (const replacement of entry.replacements) {
       if (
@@ -363,16 +374,23 @@ function safeReplace(ticket, scopeFiles) {
         );
       }
 
-      if (!content.includes(replacement.find)) {
+      const segments = content.split(replacement.find);
+      if (segments.length === 1) {
         console.log(
-          `SafeReplace: token not found in ${normalizedPath}: ${replacement.find}`
+          `SafeReplace: token not found ${replacement.find} in ${normalizedPath}`
         );
         continue;
       }
 
-      content = content.split(replacement.find).join(replacement.replace);
+      const occurrences = segments.length - 1;
+      content = segments.join(replacement.replace);
       modified = true;
+      replacementCount += occurrences;
     }
+
+    console.log(
+      `SafeReplace: replaced ${replacementCount} token(s) in ${normalizedPath}`
+    );
 
     if (modified && content !== scopeFile.content) {
       files.push({
@@ -402,24 +420,16 @@ function runSanityRails(files) {
       throw new Error("SanityRails failure");
     }
 
-    for (let i = 0; i < text.length; i += 1) {
-      const code = text.charCodeAt(i);
-      const isAllowed =
-        code === 9 ||
-        code === 10 ||
-        code === 13 ||
-        (code >= 32 && code <= 126);
-      if (!isAllowed) {
-        console.error(
-          `SanityRails: ${pathName} failed non-printable character check`
-        );
-        throw new Error("SanityRails failure");
-      }
+    if (SANITY_RAILS_INVALID_CHAR_REGEX.test(text)) {
+      console.error(
+        `SanityRails: ${pathName} failed non-printable character check`
+      );
+      throw new Error("SanityRails failure");
     }
 
     if (
       pathName.endsWith("src/app/layout.tsx") &&
-      !text.includes("export default function RootLayout(")
+      !ROOT_LAYOUT_EXPORT_ANCHORS.some((anchor) => text.includes(anchor))
     ) {
       console.error(
         `SanityRails: ${pathName} failed RootLayout export assertion`
@@ -428,8 +438,8 @@ function runSanityRails(files) {
     }
 
     if (
-      pathName.endsWith("NowPlaying.tsx") &&
-      !text.includes("export default function NowPlaying")
+      pathName.endsWith("src/app/components/NowPlaying.tsx") &&
+      !NOW_PLAYING_EXPORT_ANCHORS.some((anchor) => text.includes(anchor))
     ) {
       console.error(
         `SanityRails: ${pathName} failed NowPlaying export assertion`
